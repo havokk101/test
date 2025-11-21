@@ -1,0 +1,396 @@
+# ============================================
+# BEGINNING OF CAREERS DEMO PIPELINE (PySpark)
+# Ages 18–25, Quarterly, Worker-Month Data
+# ============================================
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+# ------------------------------------------------
+# 0. ASSUMPTIONS ABOUT YOUR BASE TABLE (df_raw)
+# ------------------------------------------------
+# df_raw has (at least) the following columns:
+#   ooid           : unique worker identifier
+#   company_id     : employer id
+#   month_start    : first day of pay month (date)
+#   dob            : date of birth
+#   gross_wages    : total wages paid in that month
+#   job_title      : raw title
+#   job_cluster    : pre-built job title cluster (20–30 groups)  <-- you can plug your own
+#   industry_map   : industry code / cluster
+#
+# If you already have is_new_hire / separation flags, you can reuse them.
+# This demo infers new hires from first appearance of each worker.
+
+df = df_raw
+
+# ------------------------------------------------
+# 1. FILTER UNIVERSE: AGES 18–25, CLEAN PAY
+# ------------------------------------------------
+
+df = df.withColumn(
+    "age",
+    F.floor(F.months_between(F.col("month_start"), F.col("dob")) / 12)
+)
+
+df = (
+    df
+    .filter((F.col("age") >= 18) & (F.col("age") <= 25))
+    .filter(F.col("gross_wages") > 0)  # simple cleaning for demo
+)
+
+# Restrict date range if you want a shorter demo period
+# df = df.filter((F.col("month_start") >= F.to_date(F.lit("2022-01-01")))
+#               & (F.col("month_start") < F.to_date(F.lit("2025-01-01"))))
+
+# ------------------------------------------------
+# 2. ADD QUARTER + BASIC TIME KEYS
+# ------------------------------------------------
+
+df = (
+    df
+    .withColumn("year",   F.year("month_start"))
+    .withColumn("q",      F.quarter("month_start"))
+    .withColumn("year_q_index", F.col("year") * 4 + F.col("q"))  # numeric key for ordering
+    .withColumn("quarter_label", F.concat_ws(" Q", F.col("year"), F.col("q")))
+)
+
+# ------------------------------------------------
+# 3. COMPUTE FIRST APPEARANCE & TENURE-LIKE INFO
+# ------------------------------------------------
+
+w_worker = Window.partitionBy("ooid")
+
+df = df.withColumn("first_month_overall", F.min("month_start").over(w_worker))
+
+# Tenure in months (approx.) at each observation
+df = df.withColumn(
+    "tenure_months",
+    F.floor(F.months_between(F.col("month_start"), F.col("first_month_overall")))
+)
+
+# For a demo, we’ll infer “new hire” as first appearance in our dataset
+df = df.withColumn("is_new_hire_month", F.when(F.col("month_start") == F.col("first_month_overall"), F.lit(1)).otherwise(0))
+
+# ------------------------------------------------
+# 4. BUILD A WORKER–QUARTER TABLE
+#    (ONE ROW PER WORKER PER QUARTER)
+# ------------------------------------------------
+
+# Aggregate monthly rows into quarterly rows at worker level
+df_worker_q = (
+    df
+    .groupBy(
+        "ooid",
+        "company_id",
+        "industry_map",
+        "job_title",
+        "job_cluster",
+        "year",
+        "q",
+        "year_q_index"
+    )
+    .agg(
+        F.sum("gross_wages").alias("total_wages_q"),
+        F.avg("gross_wages").alias("avg_wages_q"),
+        F.min("month_start").alias("first_month_in_q"),
+        F.max("month_start").alias("last_month_in_q"),
+        F.max("is_new_hire_month").alias("is_new_hire_q"),  # if they were ever a new hire in that quarter
+    )
+)
+
+# Add overall hire cohort (first quarter we ever see each worker)
+w_worker_q = Window.partitionBy("ooid")
+
+df_worker_q = (
+    df_worker_q
+    .withColumn("hire_cohort_yq", F.min("year_q_index").over(w_worker_q))
+    .withColumn("is_hire_cohort_q", F.when(F.col("year_q_index") == F.col("hire_cohort_yq"), F.lit(1)).otherwise(0))
+)
+
+# A nice label for cohort
+df_worker_q = df_worker_q.withColumn(
+    "quarter_label",
+    F.concat_ws(" Q", F.col("year"), F.col("q"))
+)
+
+# ------------------------------------------------
+# 5. QUARTERLY TOPLINE METRICS (EMPLOYMENT, PAY, HIRING)
+# ------------------------------------------------
+
+# 5.1 Employment (headcount)
+quarterly_employment = (
+    df_worker_q
+    .groupBy("year", "q", "quarter_label")
+    .agg(
+        F.countDistinct("ooid").alias("headcount_18_25")
+    )
+)
+
+# 5.2 Pay metrics (median, distribution)
+quarterly_pay = (
+    df_worker_q
+    .groupBy("year", "q", "quarter_label")
+    .agg(
+        F.expr("percentile_approx(avg_wages_q, 0.5)").alias("median_pay_18_25"),
+        F.expr("percentile_approx(avg_wages_q, 0.1)").alias("p10_pay"),
+        F.expr("percentile_approx(avg_wages_q, 0.25)").alias("p25_pay"),
+        F.expr("percentile_approx(avg_wages_q, 0.75)").alias("p75_pay"),
+        F.expr("percentile_approx(avg_wages_q, 0.9)").alias("p90_pay"),
+    )
+)
+
+# 5.3 New hire counts (simple demo: workers in their hire cohort quarter)
+quarterly_hiring = (
+    df_worker_q
+    .filter(F.col("is_hire_cohort_q") == 1)
+    .groupBy("year", "q", "quarter_label")
+    .agg(
+        F.countDistinct("ooid").alias("new_hires_18_25")
+    )
+)
+
+# 5.4 Join topline together for a neat table
+quarterly_topline = (
+    quarterly_employment
+    .join(quarterly_pay, ["year", "q", "quarter_label"], "left")
+    .join(quarterly_hiring, ["year", "q", "quarter_label"], "left")
+    .orderBy("year", "q")
+)
+
+# Optionally compute QoQ and YoY for headcount and median pay
+w_q = Window.orderBy("year", "q")
+
+quarterly_topline = (
+    quarterly_topline
+    .withColumn("headcount_qoq",
+                (F.col("headcount_18_25") - F.lag("headcount_18_25", 1).over(w_q))
+                / F.lag("headcount_18_25", 1).over(w_q))
+    .withColumn("headcount_yoy",
+                (F.col("headcount_18_25") - F.lag("headcount_18_25", 4).over(w_q))
+                / F.lag("headcount_18_25", 4).over(w_q))
+    .withColumn("median_pay_qoq",
+                (F.col("median_pay_18_25") - F.lag("median_pay_18_25", 1).over(w_q))
+                / F.lag("median_pay_18_25", 1).over(w_q))
+    .withColumn("median_pay_yoy",
+                (F.col("median_pay_18_25") - F.lag("median_pay_18_25", 4).over(w_q))
+                / F.lag("median_pay_18_25", 4).over(w_q))
+)
+
+# ------------------------------------------------
+# 6. JOB ENTRY PATTERNS (FIRST JOB)
+# ------------------------------------------------
+
+# First job = cohort quarter row for each worker
+first_jobs = df_worker_q.filter(F.col("is_hire_cohort_q") == 1)
+
+# 6.1 Top entry industries
+entry_industries = (
+    first_jobs
+    .groupBy("industry_map")
+    .agg(
+        F.countDistinct("ooid").alias("entry_count")
+    )
+)
+
+total_entries = entry_industries.agg(F.sum("entry_count").alias("total")).collect()[0]["total"]
+
+entry_industries = entry_industries.withColumn(
+    "entry_share",
+    F.col("entry_count") / F.lit(total_entries)
+)
+
+# 6.2 Top entry job clusters
+entry_job_clusters = (
+    first_jobs
+    .groupBy("job_cluster")
+    .agg(
+        F.countDistinct("ooid").alias("entry_count")
+    )
+    .orderBy(F.desc("entry_count"))
+)
+
+# 6.3 First-job tenure (how long they stay in first company)
+# We define first employer as the company_id in hire cohort quarter.
+
+first_employer = first_jobs.select(
+    "ooid", F.col("company_id").alias("first_company_id"),
+    "hire_cohort_yq"
+)
+
+# Join back to worker-quarter to see how long they stay with that company
+df_with_first_company = df_worker_q.join(first_employer, "ooid", "left")
+
+# Keep only rows at the first company
+df_first_company_spells = df_with_first_company.filter(
+    F.col("company_id") == F.col("first_company_id")
+)
+
+# For each worker, find last quarter they are still with first company
+w_first_comp = Window.partitionBy("ooid")
+
+df_first_company_spells = df_first_company_spells.withColumn(
+    "last_yq_at_first_company",
+    F.max("year_q_index").over(w_first_comp)
+)
+
+# Tenure in quarters at first company
+first_job_tenure = (
+    df_first_company_spells
+    .select("ooid", "hire_cohort_yq", "last_yq_at_first_company")
+    .dropDuplicates(["ooid", "hire_cohort_yq", "last_yq_at_first_company"])
+    .withColumn("tenure_quarters",
+                F.col("last_yq_at_first_company") - F.col("hire_cohort_yq") + F.lit(1))
+)
+
+# Summary for the report: median first-job tenure in quarters
+first_job_tenure_summary = (
+    first_job_tenure
+    .agg(
+        F.expr("percentile_approx(tenure_quarters, 0.5)").alias("median_first_job_tenure_q"),
+        F.expr("percentile_approx(tenure_quarters, 0.25)").alias("p25_first_job_tenure_q"),
+        F.expr("percentile_approx(tenure_quarters, 0.75)").alias("p75_first_job_tenure_q"),
+    )
+)
+
+# ------------------------------------------------
+# 7. MOBILITY METRICS (JOB SWITCHING & PAY MOBILITY)
+# ------------------------------------------------
+
+# Sort quarters within each worker to look at transitions
+w_mob = Window.partitionBy("ooid").orderBy("year_q_index")
+
+df_mob = (
+    df_worker_q
+    .withColumn("prev_company_id", F.lag("company_id").over(w_mob))
+    .withColumn("prev_industry_map", F.lag("industry_map").over(w_mob))
+    .withColumn("prev_total_wages_q", F.lag("total_wages_q").over(w_mob))
+)
+
+# Flags for switches (ignore the first observed quarter for each worker, since lag is null)
+df_mob = (
+    df_mob
+    .withColumn(
+        "is_switch_firm",
+        F.when(F.col("prev_company_id").isNull(), F.lit(0))
+         .when(F.col("prev_company_id") != F.col("company_id"), F.lit(1))
+         .otherwise(F.lit(0))
+    )
+    .withColumn(
+        "is_switch_industry",
+        F.when(F.col("prev_industry_map").isNull(), F.lit(0))
+         .when(F.col("prev_industry_map") != F.col("industry_map"), F.lit(1))
+         .otherwise(F.lit(0))
+    )
+    .withColumn(
+        "pay_change",
+        F.col("total_wages_q") - F.col("prev_total_wages_q")
+    )
+    .withColumn(
+        "pay_change_up",
+        F.when(F.col("prev_total_wages_q").isNull(), F.lit(None).cast("double"))
+         .when(F.col("pay_change") > 0, F.lit(1.0))
+         .otherwise(F.lit(0.0))
+    )
+)
+
+# 7.1 Overall mobility summary for demo
+mobility_summary = (
+    df_mob
+    .filter(F.col("prev_company_id").isNotNull())  # only quarters where we can see a prior state
+    .agg(
+        F.sum("is_switch_firm").alias("num_firm_switches"),
+        F.sum("is_switch_industry").alias("num_industry_switches"),
+        F.count("*").alias("num_observed_transitions"),
+        F.avg("pay_change_up").alias("share_moves_up_pay")
+    )
+)
+
+# You might also want shares at the worker level (e.g., % of workers who switch firm within 4 quarters),
+# but this gives you a simple demo table.
+
+# ------------------------------------------------
+# 8. INDUSTRY-TO-INDUSTRY FLOW MATRIX (SIMPLE)
+# ------------------------------------------------
+
+# Keep only rows where there is a firm transition (to avoid double-counting)
+flows = df_mob.filter(
+    (F.col("prev_industry_map").isNotNull()) &
+    (F.col("industry_map").isNotNull())
+)
+
+industry_flows = (
+    flows
+    .groupBy("prev_industry_map", "industry_map")
+    .agg(F.countDistinct("ooid").alias("num_workers_moved"))
+)
+
+# Optionally convert to shares out of each origin industry
+w_origin = Window.partitionBy("prev_industry_map")
+
+industry_flows = (
+    industry_flows
+    .withColumn("origin_total", F.sum("num_workers_moved").over(w_origin))
+    .withColumn("flow_share",
+                F.col("num_workers_moved") / F.col("origin_total"))
+)
+
+# ------------------------------------------------
+# 9. RETENTION METRICS (COHORT-BASED, 1Y DEMO)
+# ------------------------------------------------
+# For a demo, show 4-quarter (approx 12-month) retention for hire cohorts.
+
+# Base: each row is worker-quarter with known hire_cohort_yq and year_q_index
+df_ret = df_worker_q.select("ooid", "hire_cohort_yq", "year_q_index")
+
+# 9.1 Define cohort-quarter flags: present at +1, +2, +4 quarters after hire
+# We'll build a helper table of all worker-quarter combos and then self-join.
+
+hire_quarter = df_ret.filter(F.col("year_q_index") == F.col("hire_cohort_yq")) \
+                     .select("ooid", "hire_cohort_yq").dropDuplicates()
+
+# Helper to test presence at offset k quarters after hire
+def retention_at_offset(df_ret, hire_quarter, k):
+    target = (
+        df_ret
+        .withColumn("target_yq", F.col("hire_cohort_yq") + F.lit(k))
+        .join(hire_quarter, ["ooid", "hire_cohort_yq"], "inner")
+    )
+    present = (
+        target
+        .join(df_ret.select("ooid", "year_q_index").dropDuplicates(),
+              (target.ooid == df_ret.ooid) & (target.target_yq == df_ret.year_q_index),
+              "left_semi")
+    )
+    # Workers in the cohort:
+    total_cohort = hire_quarter.count()
+    retained = present.count()
+    return retained, total_cohort
+
+# Example: retention 1,2,4 quarters after hire (approx 3,6,12 months)
+ret_1q, cohort_size = retention_at_offset(df_ret, hire_quarter, k=1)
+ret_2q, _          = retention_at_offset(df_ret, hire_quarter, k=2)
+ret_4q, _          = retention_at_offset(df_ret, hire_quarter, k=4)
+
+# You can put these into a small Spark DataFrame for the report
+retention_summary = spark.createDataFrame(
+    [
+        ("1_quarter", ret_1q / cohort_size if cohort_size > 0 else None),
+        ("2_quarters", ret_2q / cohort_size if cohort_size > 0 else None),
+        ("4_quarters", ret_4q / cohort_size if cohort_size > 0 else None),
+    ],
+    ["horizon", "retention_rate"]
+)
+
+# ============================================
+# END OF DEMO PIPELINE
+# ============================================
+
+# At this point, key tables you can feed into your PPT/demo:
+#   quarterly_topline        : headcount, pay, hiring, QoQ/YoY
+#   entry_industries         : top entry industries + shares
+#   entry_job_clusters       : top entry job clusters
+#   first_job_tenure_summary : median / p25 / p75 first-job tenure
+#   mobility_summary         : firm/industry switches, share moving up in pay
+#   industry_flows           : origin-destination matrix with shares
+#   retention_summary        : 1, 2, 4 quarter retention rates
